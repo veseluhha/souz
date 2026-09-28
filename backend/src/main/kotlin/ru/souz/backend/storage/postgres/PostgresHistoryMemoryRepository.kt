@@ -117,6 +117,14 @@ internal class PostgresHistoryMemoryRepository(
             it.setInstant(1, clock.instant().plusSeconds(minOf(300L, 5L shl minOf(fragment.attempts - 1, 6))))
         }
 
+    /** Finishes an exhausted fragment so the chat's later fragments can proceed. */
+    suspend fun fail(fragment: HistoryMemoryFragment): Boolean =
+        update(fragment, "completed_at = ?, failed_at = ?, payload = null, lease_token = null, lease_until = null") {
+            val now = clock.instant()
+            it.setInstant(1, now)
+            it.setInstant(2, now)
+        }
+
     private suspend fun update(
         fragment: HistoryMemoryFragment,
         assignment: String,
@@ -126,9 +134,10 @@ internal class PostgresHistoryMemoryRepository(
             "update history_memory_fragments set $assignment where id = ? and lease_token = ? and lease_until > ?",
         ).use { statement ->
             bind(statement)
-            statement.setObject(2, fragment.id)
-            statement.setObject(3, fragment.leaseToken)
-            statement.setInstant(4, clock.instant())
+            val fence = assignment.count { it == '?' }
+            statement.setObject(fence + 1, fragment.id)
+            statement.setObject(fence + 2, fragment.leaseToken)
+            statement.setInstant(fence + 3, clock.instant())
             statement.executeUpdate() == 1
         }
     }

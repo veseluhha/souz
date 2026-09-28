@@ -1,5 +1,6 @@
 package ru.souz.backend.memory.hindsight
 
+import com.fasterxml.jackson.databind.JsonNode
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.timeout
@@ -44,6 +45,7 @@ class HindsightConversationMemoryRuntime(
     baseUrl: String,
     private val apiToken: String? = null,
     private val clock: Clock = Clock.systemUTC(),
+    private val retainAsync: Boolean = true,
 ) : ConversationMemoryRuntime {
     private val baseUrl = baseUrl.trimEnd('/')
     private val logger = LoggerFactory.getLogger(HindsightConversationMemoryRuntime::class.java)
@@ -182,9 +184,12 @@ class HindsightConversationMemoryRuntime(
                 val response = httpClient.post("$baseUrl/v1/default/banks/${bankId.encodeURLPathPart()}/memories") {
                     jsonRequest(apiToken)
                     timeout { requestTimeoutMillis = RETAIN_TIMEOUT_MILLIS }
-                    setBody(mapOf("items" to listOf(item)))
+                    setBody(mapOf("items" to listOf(item), "async" to retainAsync))
                 }.requireSuccess().body<RetainResponse>()
-                check(response.success && !response.async) { "Hindsight retain did not complete synchronously" }
+                check(response.success) { "Hindsight retain was not accepted" }
+                response.operationId()?.let {
+                    logger.info("Hindsight retain accepted documentId={} operationId={}", item["document_id"], it)
+                }
                 return
             } catch (error: IOException) {
                 if (attempt > 0 || !retryOnIoFailure) throw error
@@ -244,4 +249,11 @@ private data class RecalledMemory(
     val score: Float get() = scores?.get("final") ?: 0f
 }
 
-private data class RetainResponse(val success: Boolean, val async: Boolean = false)
+private data class RetainResponse(
+    val success: Boolean,
+    val operation_id: String? = null,
+    val operation_ids: JsonNode? = null,
+) {
+    fun operationId(): String? = operation_id?.takeIf(String::isNotBlank)
+        ?: operation_ids?.takeIf(JsonNode::isArray)?.joinToString(",", transform = JsonNode::asText)?.takeIf(String::isNotBlank)
+}

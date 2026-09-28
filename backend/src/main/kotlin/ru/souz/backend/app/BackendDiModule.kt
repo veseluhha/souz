@@ -280,6 +280,7 @@ fun backendDiModule(
                 baseUrl = hindsightUrl,
                 apiToken = appConfig.hindsightApiToken,
                 clock = instance(),
+                retainAsync = appConfig.hindsightRetainAsync,
             )
         } else {
             NoopConversationMemoryRuntime

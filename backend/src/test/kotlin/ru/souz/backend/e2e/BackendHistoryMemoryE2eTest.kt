@@ -37,6 +37,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeout
 import ru.souz.backend.config.BackendFeatureFlags
 import ru.souz.backend.http.BackendHttpRoutes
+import ru.souz.backend.memory.hindsight.HISTORY_MEMORY_MAX_ATTEMPTS
 import ru.souz.backend.memory.hindsight.HISTORY_MEMORY_MAX_CHARS
 import ru.souz.backend.storage.postgres.newPostgresSchema
 import ru.souz.llms.LLMMessageRole
@@ -296,6 +297,8 @@ class BackendHistoryMemoryE2eTest {
             })
             assertEquals(2, hindsight.historyItems.size)
             assertTrue(hindsight.paths.all { it == "/v1/default/banks/$owner/memories" })
+            assertEquals(3, hindsight.items.size)
+            assertTrue(hindsight.items.all { it.async })
             assertTrue(hindsight.recalls.isEmpty())
         }
     }
@@ -324,6 +327,63 @@ class BackendHistoryMemoryE2eTest {
             clock.advance(31)
             assertTrue(backend.captureHistoryMemory())
             assertNotEquals(original.item["document_id"], hindsight.items.last().item["document_id"])
+        }
+    }
+
+    @Test
+    fun `exhausted fragment fails without blocking its chat or other chats`() {
+        backendE2eTest("history_memory_exhausted", hindsightUrl = HINDSIGHT_TEST_URL, clock = clock, providerClients = hindsight.clients()) {
+            hindsight.reject = { it.newRecordsContain("unextractable") }
+            val failing = createPublicChat(UUID.randomUUID().toString())
+            val healthy = createPublicChat(UUID.randomUUID().toString())
+            withPublicSocket(failing) { appendHistory(it, failing, "stuck", "user", "An unextractable message") }
+            clock.advance(31)
+            assertTrue(backend.captureHistoryMemory())
+            withPublicSocket(failing) { appendHistory(it, failing, "next", "user", "The next message in this chat") }
+            withPublicSocket(healthy) { appendHistory(it, healthy, "other", "user", "A message in another chat") }
+            // Remaining attempts of the stuck fragment, then the other chat and the next fragment of the stuck chat.
+            repeat(HISTORY_MEMORY_MAX_ATTEMPTS + 1) {
+                clock.advance(301)
+                assertTrue(backend.captureHistoryMemory())
+            }
+            assertFalse(backend.captureHistoryMemory())
+
+            assertEquals(HISTORY_MEMORY_MAX_ATTEMPTS, hindsight.rejected.size)
+            val outcomes = hindsight.outcomes.toList()
+            assertTrue(outcomes.indexOf("chat:$healthy" to true) < outcomes.lastIndexOf("chat:$failing" to false))
+            assertEquals("chat:$failing" to true, outcomes.last())
+            assertTrue(hindsight.historyItems.last().item["content"].asText().contains("The next message in this chat"))
+            assertEquals(
+                listOf(Triple(HISTORY_MEMORY_MAX_ATTEMPTS, true, true), Triple(1, true, false)),
+                fragmentStates(failing),
+            )
+        }
+    }
+
+    @Test
+    fun `fragment past the attempt limit gets exactly one attempt after rollout`() {
+        backendE2eTest("history_memory_legacy_attempts", hindsightUrl = HINDSIGHT_TEST_URL, clock = clock, providerClients = hindsight.clients()) {
+            hindsight.reject = { it.newRecordsContain("unextractable") }
+            val chat = createPublicChat(UUID.randomUUID().toString())
+            withPublicSocket(chat) { appendHistory(it, chat, "stuck", "user", "An unextractable message") }
+            clock.advance(31)
+            assertTrue(backend.captureHistoryMemory())
+            sql { connection ->
+                connection.prepareStatement("update history_memory_fragments set attempts = 20 where chat_id = ?::uuid").use {
+                    it.setString(1, chat)
+                    it.executeUpdate()
+                }
+            }
+            withPublicSocket(chat) { appendHistory(it, chat, "next", "user", "The next message in this chat") }
+            clock.advance(301)
+
+            assertTrue(backend.captureHistoryMemory())
+            assertEquals(2, hindsight.rejected.size)
+            assertEquals(listOf(Triple(21, true, true), Triple(0, false, false)), fragmentStates(chat))
+            assertTrue(backend.captureHistoryMemory())
+            assertFalse(backend.captureHistoryMemory())
+            assertEquals(2, hindsight.rejected.size)
+            assertTrue(hindsight.historyItems.single().item["content"].asText().contains("The next message in this chat"))
         }
     }
 
@@ -437,6 +497,23 @@ private val HISTORY_FIELDS = setOf("content", "timestamp", "document_id", "tags"
 
 private fun JsonNode.fieldSet(): Set<String> = fieldNames().asSequence().toSet()
 
+/** Matches only a history document's own records, not the preceding dialogue it carries as context. */
+private fun JsonNode.newRecordsContain(text: String): Boolean =
+    this["content"].asText().substringAfter("NEW dialogue records").contains(text)
+
+/** Attempts, completion and failure of the chat's fragments in queue order. */
+private fun BackendE2eScope.fragmentStates(chat: String): List<Triple<Int, Boolean, Boolean>> = sql { connection ->
+    connection.prepareStatement(
+        "select attempts, completed_at is not null as completed, failed_at is not null as failed " +
+            "from history_memory_fragments where chat_id = ?::uuid order by first_seq",
+    ).use { statement ->
+        statement.setString(1, chat)
+        statement.executeQuery().use { rows ->
+            buildList { while (rows.next()) add(Triple(rows.getInt("attempts"), rows.getBoolean("completed"), rows.getBoolean("failed"))) }
+        }
+    }
+}
+
 private fun assertHistoryTimestamps(item: JsonNode, offset: ZoneOffset) {
     val records = item["content"].asText().lines().filter { it.startsWith("{") }.map { jacksonObjectMapper().readTree(it) }
     assertTrue(records.isNotEmpty())
@@ -472,11 +549,15 @@ private class HistoryTestClock : Clock() {
 }
 
 private class HistoryHindsightStub {
-    data class Item(val bank: String, val item: JsonNode)
+    data class Item(val bank: String, val item: JsonNode, val async: Boolean)
     val items = CopyOnWriteArrayList<Item>()
+    val rejected = CopyOnWriteArrayList<Item>()
+    /** Retain outcomes in request order: the item's chat tag and whether it was accepted. */
+    val outcomes = CopyOnWriteArrayList<Pair<String, Boolean>>()
     val recalls = CopyOnWriteArrayList<String>()
     val paths = CopyOnWriteArrayList<String>()
     val historyItems get() = items.filter { it.item.path("metadata").path("source").asText() == "souz-history" }
+    var reject: (JsonNode) -> Boolean = { false }
     var failAfterRetain = false
     var recalledText: String? = null
     var gate: CompletableDeferred<Unit>? = null
@@ -488,6 +569,7 @@ private class HistoryHindsightStub {
             val path = request.url.encodedPath
             paths += path
             val bank = path.substringAfter("/banks/").substringBefore('/')
+            var status = HttpStatusCode.OK
             val body = when {
                 path.endsWith("/recall") -> {
                     recalls += mapper.readTree(request.body.toByteArray())["query"].asText()
@@ -496,15 +578,27 @@ private class HistoryHindsightStub {
                     ))
                 }
                 path.endsWith("/memories") -> {
-                    items += Item(bank, mapper.readTree(request.body.toByteArray())["items"].single())
-                    started.complete(Unit)
-                    gate?.await()
-                    if (failAfterRetain) throw IOException("simulated lost response")
-                    """{"success":true,"async":false}"""
+                    val payload = mapper.readTree(request.body.toByteArray())
+                    val item = Item(bank, payload["items"].single(), payload.path("async").asBoolean())
+                    val chat = item.item.path("tags").joinToString(",", transform = JsonNode::asText)
+                    if (reject(item.item)) {
+                        rejected += item
+                        outcomes += chat to false
+                        status = HttpStatusCode.InternalServerError
+                        """{"detail":"extraction unavailable"}"""
+                    } else {
+                        items += item
+                        outcomes += chat to true
+                        started.complete(Unit)
+                        gate?.await()
+                        if (failAfterRetain) throw IOException("simulated lost response")
+                        if (item.async) """{"success":true,"async":true,"operation_id":"operation-${items.size}"}"""
+                        else """{"success":true,"async":false}"""
+                    }
                 }
                 else -> error("Unexpected Hindsight request ${request.method.value} $path")
             }
-            respond(body, headers = headersOf(HttpHeaders.ContentType, "application/json"))
+            respond(body, status, headersOf(HttpHeaders.ContentType, "application/json"))
         }) { providerHttpClientDefaults() }
         return ProviderHttpClients(client, client)
     }

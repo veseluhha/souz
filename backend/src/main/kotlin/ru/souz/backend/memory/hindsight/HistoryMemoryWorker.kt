@@ -10,6 +10,8 @@ import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import ru.souz.backend.storage.postgres.PostgresHistoryMemoryRepository
 
+internal const val HISTORY_MEMORY_MAX_ATTEMPTS = 12
+
 internal class HistoryMemoryWorker(
     private val repository: PostgresHistoryMemoryRepository,
     private val memory: HindsightConversationMemoryRuntime,
@@ -52,10 +54,16 @@ internal class HistoryMemoryWorker(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            repository.retry(fragment)
-            logger.warn("History memory retry chatId={} fragmentId={} attempt={} category={}",
-                fragment.chatId, fragment.id, fragment.attempts,
-                if (error is HindsightHttpFailure) "http_${error.statusCode}" else error.javaClass.simpleName)
+            val category = if (error is HindsightHttpFailure) "http_${error.statusCode}" else error.javaClass.simpleName
+            if (fragment.attempts >= HISTORY_MEMORY_MAX_ATTEMPTS) {
+                repository.fail(fragment)
+                logger.error("History memory failed chatId={} fragmentId={} attempts={} category={}",
+                    fragment.chatId, fragment.id, fragment.attempts, category)
+            } else {
+                repository.retry(fragment)
+                logger.warn("History memory retry chatId={} fragmentId={} attempt={} category={}",
+                    fragment.chatId, fragment.id, fragment.attempts, category)
+            }
         }
         return true
     }
