@@ -39,6 +39,7 @@ import ru.souz.backend.config.BackendFeatureFlags
 import ru.souz.backend.http.BackendHttpRoutes
 import ru.souz.backend.memory.hindsight.HISTORY_MEMORY_MAX_ATTEMPTS
 import ru.souz.backend.memory.hindsight.HISTORY_MEMORY_MAX_CHARS
+import ru.souz.backend.memory.hindsight.HISTORY_MEMORY_TURN_COPY_WINDOW_HOURS
 import ru.souz.backend.storage.postgres.newPostgresSchema
 import ru.souz.llms.LLMMessageRole
 import ru.souz.llms.http.ProviderHttpClients
@@ -202,6 +203,102 @@ class BackendHistoryMemoryE2eTest {
             clock.advance(31)
             assertTrue(backend.captureHistoryMemory())
             assertHistoryTimestamps(hindsight.historyItems.last().item, ZoneOffset.ofHours(10))
+        }
+    }
+
+    @Test
+    fun `history copies of a completed turn are context and each user message is retained once`() {
+        backendE2eTest("history_memory_turn_copy", hindsightUrl = HINDSIGHT_TEST_URL, clock = clock, providerClients = hindsight.clients()) {
+            val owner = UUID.randomUUID().toString()
+            val chat = createPublicChat(owner)
+            withPublicSocket(chat) { socket ->
+                completeTurn(socket, chat, owner, "turn", "Book a table for Friday ")
+                appendHistory(socket, chat, "lights", "user", "Turn on the lights")
+                appendHistory(socket, chat, "copy", "user", "Book a table for Friday")
+                appendHistory(socket, chat, "answer", "assistant", "assistant reply to Book a table for Friday ")
+                appendHistory(socket, chat, "remind", "user", "Remind me about it tomorrow")
+            }
+            eventually("completed-turn memory") { hindsight.items.firstOrNull { it.item["document_id"].asText().startsWith("souz-turn-") } }
+            clock.advance(31)
+            assertTrue(backend.captureHistoryMemory())
+
+            val history = hindsight.historyItems.single().item
+            assertEquals(listOf("user" to "Turn on the lights", "user" to "Remind me about it tomorrow"), history.newRecords())
+            assertEquals(
+                listOf("user" to "Book a table for Friday", "assistant" to "assistant reply to Book a table for Friday"),
+                history.contextRecords(),
+            )
+            assertEquals(
+                listOf("Book a table for Friday", "Turn on the lights", "Remind me about it tomorrow"),
+                hindsight.extractionTargets().filter { it.first == "user" }.map { it.second },
+            )
+        }
+    }
+
+    @Test
+    fun `history copy outside the turn window remains an extraction target`() {
+        backendE2eTest("history_memory_turn_copy_window", hindsightUrl = HINDSIGHT_TEST_URL, clock = clock, providerClients = hindsight.clients()) {
+            val owner = UUID.randomUUID().toString()
+            val chat = createPublicChat(owner)
+            withPublicSocket(chat) { socket ->
+                completeTurn(socket, chat, owner, "turn", "Book a table for Friday")
+                sql { connection ->
+                    connection.prepareStatement(
+                        "update messages set created_at = created_at - interval '${HISTORY_MEMORY_TURN_COPY_WINDOW_HOURS + 1} hours' " +
+                            "where id in (select user_message_id from agent_executions where chat_id = ?::uuid " +
+                            "union select assistant_message_id from agent_executions where chat_id = ?::uuid)",
+                    ).use {
+                        it.setString(1, chat)
+                        it.setString(2, chat)
+                        assertEquals(2, it.executeUpdate())
+                    }
+                }
+                appendHistory(socket, chat, "copy", "user", "Book a table for Friday")
+            }
+            clock.advance(31)
+            assertTrue(backend.captureHistoryMemory())
+            assertEquals(listOf("user" to "Book a table for Friday"), hindsight.historyItems.single().item.newRecords())
+        }
+    }
+
+    @Test
+    fun `history copy of an unfinished turn remains an extraction target`() {
+        val prompt = "Find travel options for the weekend"
+        backendE2eTest("history_memory_turn_copy_running", hindsightUrl = HINDSIGHT_TEST_URL, clock = clock,
+            providerClients = hindsight.clients(), llm = E2eLlmApi().apply {
+                requestSkillForPrompt(prompt, "web.search", mapOf("query" to "weekend travel options"))
+            }) {
+            val owner = UUID.randomUUID().toString()
+            val chat = createPublicChat(owner)
+            withPublicSocket(chat) { socket ->
+                socket.send(Frame.Text(messageFrame(chat, owner, "travel", text = prompt)))
+                assertEquals("accepted", readJson(socket)["status"].asText())
+                repeat(2) { readJson(socket) } // Thread status and the pending client tool call.
+                appendHistory(socket, chat, "copy", "user", prompt)
+            }
+            clock.advance(31)
+            assertTrue(backend.captureHistoryMemory())
+            assertEquals(listOf("user" to prompt), hindsight.historyItems.single().item.newRecords())
+        }
+    }
+
+    @Test
+    fun `history copy sent before its turn becomes context while its fragment is pending`() {
+        backendE2eTest("history_memory_turn_copy_first", hindsightUrl = HINDSIGHT_TEST_URL, clock = clock, providerClients = hindsight.clients()) {
+            val owner = UUID.randomUUID().toString()
+            val chat = createPublicChat(owner)
+            withPublicSocket(chat) { socket ->
+                appendHistory(socket, chat, "copy", "user", "Book a flight to Kazan")
+                appendHistory(socket, chat, "seat", "user", "I prefer window seats")
+                completeTurn(socket, chat, owner, "turn", "Book a flight to Kazan")
+            }
+            eventually("completed-turn memory") { hindsight.items.firstOrNull { it.item["document_id"].asText().startsWith("souz-turn-") } }
+            clock.advance(31)
+            assertTrue(backend.captureHistoryMemory())
+
+            val history = hindsight.historyItems.single().item
+            assertEquals(listOf("user" to "I prefer window seats"), history.newRecords())
+            assertEquals(listOf("user" to "Book a flight to Kazan"), history.contextRecords())
         }
     }
 
@@ -496,6 +593,29 @@ private val COMPLETED_TURN_FIELDS = setOf("content", "timestamp", "tags", "docum
 private val HISTORY_FIELDS = setOf("content", "timestamp", "document_id", "tags", "observation_scopes", "metadata")
 
 private fun JsonNode.fieldSet(): Set<String> = fieldNames().asSequence().toSet()
+
+private suspend fun BackendE2eScope.completeTurn(
+    socket: DefaultClientWebSocketSession, chat: String, owner: String, request: String, text: String,
+) {
+    socket.send(Frame.Text(messageFrame(chat, owner, request, text = text)))
+    assertEquals("accepted", readJson(socket)["status"].asText())
+    assertEquals("thread.status", readJson(socket)["type"].asText())
+    assertEquals("thread.completed", readJson(socket)["type"].asText())
+}
+
+/** Role and text of a history document's NEW records. */
+private fun JsonNode.newRecords() = dialogue(this["content"].asText().substringAfter("NEW dialogue records"))
+
+/** Role and text of a history document's CONTEXT ONLY records. */
+private fun JsonNode.contextRecords() = dialogue(this["content"].asText().substringBefore("NEW dialogue records"))
+
+private fun dialogue(text: String): List<Pair<String, String>> = text.lines().filter { it.startsWith("{") }
+    .map { jacksonObjectMapper().readTree(it) }.map { it["role"].asText() to it["text"].asText() }
+
+/** Messages the memory service extracts from: every completed-turn record and the NEW records of history documents. */
+private fun HistoryHindsightStub.extractionTargets(): List<Pair<String, String>> = items.map { it.item }.flatMap { item ->
+    if (item.path("metadata").path("source").asText() == "souz-history") item.newRecords() else dialogue(item["content"].asText())
+}
 
 /** Matches only a history document's own records, not the preceding dialogue it carries as context. */
 private fun JsonNode.newRecordsContain(text: String): Boolean =

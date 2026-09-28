@@ -8,7 +8,9 @@ import java.time.Instant
 import java.util.UUID
 import javax.sql.DataSource
 import ru.souz.backend.chat.model.ChatMessage
+import ru.souz.backend.execution.model.AgentExecutionStatus
 import ru.souz.backend.execution.service.METADATA_TIME_ZONE
+import ru.souz.backend.memory.hindsight.HISTORY_MEMORY_TURN_COPY_WINDOW_HOURS
 import ru.souz.backend.memory.hindsight.HistoryMemoryDocument
 import ru.souz.backend.memory.hindsight.HistoryMemoryFragment
 import ru.souz.backend.memory.hindsight.HistoryMemorySource
@@ -78,7 +80,12 @@ internal class PostgresHistoryMemoryRepository(
                   where u.user_id = m.user_id and u.chat_id = m.chat_id and u.role = 'user' and u.seq <= m.seq
                   order by u.seq desc limit 1) as user_intent, (select e.metadata ->> '$METADATA_TIME_ZONE'
                   from agent_executions e where e.user_id = f.user_id and e.chat_id = f.chat_id
-                  order by e.started_at desc limit 1) as time_zone
+                  order by e.started_at desc limit 1) as time_zone, exists (select 1 from agent_executions e
+                  join messages t on t.id in (e.user_message_id, e.assistant_message_id)
+                  where e.user_id = m.user_id and e.chat_id = m.chat_id and e.status = '${AgentExecutionStatus.COMPLETED.value}'
+                    and t.role = m.role and btrim(t.content, E' \t\r\n') = btrim(m.content, E' \t\r\n')
+                    and t.created_at between m.created_at - interval '$HISTORY_MEMORY_TURN_COPY_WINDOW_HOURS hours'
+                      and m.created_at + interval '$HISTORY_MEMORY_TURN_COPY_WINDOW_HOURS hours') as turn_copy
                 from history_memory_fragments f join messages m on m.user_id = f.user_id and m.chat_id = f.chat_id
                 where f.id = ? and m.id = any(f.source_ids || array(
                   select unnest(source_ids) from history_memory_fragments
@@ -91,7 +98,8 @@ internal class PostgresHistoryMemoryRepository(
                     val sources = mutableListOf<HistoryMemorySource>()
                     val preceding = mutableListOf<HistoryMemorySource>()
                     while (rows.next()) {
-                        val target = if (rows.getBoolean("current_source")) sources else preceding
+                        // A copy of a completed turn stays as context: the turn's own document already carries it.
+                        val target = if (rows.getBoolean("current_source") && !rows.getBoolean("turn_copy")) sources else preceding
                         target += HistoryMemorySource(
                             rows.getString("id"), rows.getLong("seq"), rows.getString("role"), rows.getString("content"),
                             memoryTimestamp(rows.instant("created_at"), rows.getString("time_zone")), rows.getString("user_intent"),

@@ -12,6 +12,9 @@ import ru.souz.backend.storage.postgres.PostgresHistoryMemoryRepository
 
 internal const val HISTORY_MEMORY_MAX_ATTEMPTS = 12
 
+/** A history message this close in time to an identical message of a completed turn is context only. */
+internal const val HISTORY_MEMORY_TURN_COPY_WINDOW_HOURS = 24
+
 internal class HistoryMemoryWorker(
     private val repository: PostgresHistoryMemoryRepository,
     private val memory: HindsightConversationMemoryRuntime,
